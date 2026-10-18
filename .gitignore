@@ -1,0 +1,12 @@
+/work/
+**/wifi_defaults.h
+**/backups/
+*.bin
+*.elf
+*.map
+*.zip
+**/SHA256.txt
+*.log
+.env
+.env.*
+__pycache__/
