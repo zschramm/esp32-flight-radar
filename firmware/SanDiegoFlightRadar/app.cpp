@@ -11,6 +11,7 @@
 #include <memory>
 #include "lvgl_v8_port.h"
 #include "radar_math.h"
+#include "http_retry.h"
 #if __has_include("wifi_defaults.h")
 #include "wifi_defaults.h"
 #else
@@ -55,6 +56,15 @@ double centerLat = 32.7157, centerLon = -117.1611;
 bool usbSetup = false, followNearest = true;
 volatile bool setupRequested = false, resumeRequested = false;
 uint32_t lastGood = 0, nextPoll = 0, pollDelay = POLL_MS, nextRoute = 0;
+uint64_t feedRetryUntil=0;
+uint32_t feedRetryRemaining(){const int64_t now=time(nullptr);return now>0 && feedRetryUntil>uint64_t(now)?feed_retry::seconds(feedRetryUntil-now):0;}
+void saveFeedRetry(uint64_t until){
+    feedRetryUntil=until;
+    Preferences storage;
+    // Separate from Wi-Fi/location and specific to this provider. Reboots and
+    // GUI updates must not bypass a provider's explicit rate-limit cooldown.
+    if(storage.begin("radar-feed-fi",false)){storage.putULong64("retry-until",until);storage.end();}
+}
 bool haveData = false;
 char networkState[64] = "Connecting to Wi-Fi";
 Plane planes[MAX_PLANES];
@@ -266,16 +276,21 @@ void refreshUI(lv_timer_t *) {
     if(followNearest) chooseNearest();
     int count=0;for(int i=0;i<planeCount;i++) if(fresh(planes[i])&&visibleOnRadar(planes[i])) count++;
     char b[100]; snprintf(b,sizeof(b),"%d shown / %g mi ring",count,viewMiles()); lv_label_set_text(countLabel,b);
-    if(haveData) snprintf(b,sizeof(b),"%s  /  %lus ago",networkState,(unsigned long)((millis()-lastGood)/1000));
+    uint32_t wait=feedRetryRemaining();
+    if(wait>=3600) snprintf(b,sizeof(b),"adsb.fi limit / retry in %luh %lum",(unsigned long)(wait/3600),(unsigned long)((wait%3600)/60));
+    else if(wait) snprintf(b,sizeof(b),"adsb.fi limit / retry in %lum %lus",(unsigned long)(wait/60),(unsigned long)(wait%60));
+    else if(haveData) snprintf(b,sizeof(b),"%s  /  %lus ago",networkState,(unsigned long)((millis()-lastGood)/1000));
     else strlcpy(b,networkState,sizeof(b));
     lv_label_set_text(statusLabel,b);
-    lv_obj_set_style_text_color(statusLabel,lv_color_hex(haveData && millis()-lastGood<30000 && WiFi.status()==WL_CONNECTED ? CYAN : AMBER),0);
+    lv_obj_set_style_text_color(statusLabel,lv_color_hex(!wait && haveData && millis()-lastGood<30000 && WiFi.status()==WL_CONNECTED ? CYAN : AMBER),0);
     lv_label_set_text(cycleLabel,followNearest ? "NEAREST ON" : "NEAREST");
     if(count) lv_obj_add_flag(emptyLabel,LV_OBJ_FLAG_HIDDEN); else {lv_obj_clear_flag(emptyLabel,LV_OBJ_FLAG_HIDDEN);lv_label_set_text(emptyLabel,haveData && millis()-lastGood<30000 ? "No airborne aircraft in this view" : "Waiting for fresh aircraft positions");}
     details(); lv_obj_invalidate(radarArea);weather::tick();
 }
 void changeRadarZoom(int delta){
-    radarZoom=std::clamp(radarZoom-delta,0,LAST_RADAR_ZOOM);nextPoll=0;char b[24];snprintf(b,sizeof(b),"%g mi",viewMiles()/2);lv_label_set_text(innerRangeLabel,b);snprintf(b,sizeof(b),"%g mi",viewMiles());lv_label_set_text(outerRangeLabel,b);
+    // Redraw immediately; fetch the new extent at the next permitted poll.
+    // Touch zoom must never bypass normal pacing or an HTTP 429 cooldown.
+    radarZoom=std::clamp(radarZoom-delta,0,LAST_RADAR_ZOOM);char b[24];snprintf(b,sizeof(b),"%g mi",viewMiles()/2);lv_label_set_text(innerRangeLabel,b);snprintf(b,sizeof(b),"%g mi",viewMiles());lv_label_set_text(outerRangeLabel,b);
     if(radarZoom==LAST_RADAR_ZOOM)lv_obj_add_state(radarMinus,LV_STATE_DISABLED);else lv_obj_clear_state(radarMinus,LV_STATE_DISABLED);
     if(radarZoom==0)lv_obj_add_state(radarPlus,LV_STATE_DISABLED);else lv_obj_clear_state(radarPlus,LV_STATE_DISABLED);refreshUI(nullptr);
 }
@@ -432,7 +447,7 @@ public:
 int getJSON(const String &url,JsonDocument &doc,uint32_t &retrySeconds) {
     WiFiClientSecure client;client.setCACertBundle(x509_crt_bundle_start,x509_crt_bundle_end-x509_crt_bundle_start);client.setHandshakeTimeout(8);
     HTTPClient http;http.setConnectTimeout(8000);http.setTimeout(8000);http.useHTTP10(false);http.setReuse(false);
-    http.setUserAgent("SanDiegoFlightRadar/1.4 (personal ESP32 display)");
+    http.setUserAgent("SanDiegoFlightRadar/1.5 (personal ESP32 display)");
     if(!http.begin(client,url))return -1;
     http.addHeader("Accept-Encoding","identity");
     const char *headers[]={"Retry-After","X-RateLimit-Reset"};http.collectHeaders(headers,2);
@@ -511,7 +526,7 @@ AircraftAllocator aircraftAllocator;
 int getAircraftJSON(const String &url,JsonDocument &doc,uint32_t &retry){
     WiFiClientSecure client;client.setCACertBundle(x509_crt_bundle_start,x509_crt_bundle_end-x509_crt_bundle_start);client.setHandshakeTimeout(8);
     HTTPClient http;http.setConnectTimeout(8000);http.setTimeout(20000);http.useHTTP10(false);http.setReuse(false);if(!http.begin(client,url))return -1;
-    http.setUserAgent("PointLomaFlightRadar/1.4");http.addHeader("Accept-Encoding","identity");const char *headers[]={"Retry-After","X-RateLimit-Reset"};http.collectHeaders(headers,2);int code=http.GET();
+    http.setUserAgent("SanDiegoFlightRadar/1.5 (personal display; github.com/zschramm/esp32-flight-radar)");http.addHeader("Accept-Encoding","identity");const char *headers[]={"Retry-After","X-RateLimit-Reset"};http.collectHeaders(headers,2);int code=http.GET();
     if(code==200){AircraftBody body;int expected=http.getSize();int received=body.data&&expected<=int(AircraftBody::LIMIT)?http.writeToStream(&body):-8;
         Serial.printf("RADAR: download bytes=%u expected=%d result=%d heap=%u psram=%u\n",unsigned(body.size),expected,received,ESP.getFreeHeap(),ESP.getFreePsram());
         if(received<0)code=received;else{
@@ -519,15 +534,23 @@ int getAircraftJSON(const String &url,JsonDocument &doc,uint32_t &retry){
         // Read-only input makes the document own strings after the body is freed.
         auto error=deserializeJson(doc,static_cast<const uint8_t*>(body.data),body.size,DeserializationOption::Filter(filter));if(error){Serial.printf("RADAR: JSON %s\n",error.c_str());code=-2;}
     }}
-    if(code==429){long wait=http.header("Retry-After").toInt();if(wait<=0)wait=http.header("X-RateLimit-Reset").toInt();retry=wait>0?std::min(wait,86400L):120;}http.end();return code;
+    if(code==429)retry=feed_retry::delaySeconds(http.header("Retry-After").c_str(),http.header("X-RateLimit-Reset").c_str(),time(nullptr));
+    if(code!=200)Serial.printf("RADAR: provider=adsb.fi HTTP=%d retry_s=%lu\n",code,(unsigned long)retry);
+    http.end();return code;
 }
 bool pollAircraft() {
     JsonDocument doc(&aircraftAllocator);uint32_t retry=0;
     // Request the current view in nautical miles, then apply a statute-mile filter.
     const double requestMiles=std::max(10.0,viewMiles()*1.45);
-    String url="https://api.adsb.lol/v2/point/"+String(centerLat,6)+"/"+String(centerLon,6)+"/"+String(int(ceil(requestMiles/1.15077945)));
+    String url="https://opendata.adsb.fi/api/v3/lat/"+String(centerLat,6)+"/lon/"+String(centerLon,6)+"/dist/"+String(int(ceil(requestMiles/1.15077945)));
     int code=getAircraftJSON(url,doc,retry);
-    if(code!=200){char b[60];snprintf(b,sizeof(b),"Feed unavailable (%d)",code);setState(b);pollDelay=std::min(pollDelay*2,uint32_t(300000));if(code==429)pollDelay=retry*1000;return false;}
+    if(code!=200){
+        char b[60];snprintf(b,sizeof(b),"adsb.fi unavailable (%d)",code);setState(b);
+        pollDelay=std::min(pollDelay*2,uint32_t(300000));
+        if(code==429){saveFeedRetry(uint64_t(time(nullptr))+std::max(retry,uint32_t(10)));setState("adsb.fi rate limited");pollDelay=POLL_MS;}
+        return false;
+    }
+    if(feedRetryUntil)saveFeedRetry(0);
     if(!doc["ac"].is<JsonArray>()){setState("Unexpected feed response");pollDelay=60000;return false;}
     // Reject cached upstream snapshots even when the HTTP request itself succeeded.
     double timestamp=doc["now"]|0.0;if(timestamp>1e11)timestamp/=1000.0;
@@ -555,7 +578,7 @@ bool pollAircraft() {
     }
     std::sort(next.get(),next.get()+count,[](const Plane&a,const Plane&b){return a.miles<b.miles;});
     lvgl_port_lock(-1);memcpy(planes,next.get(),sizeof(Plane)*count);planeCount=count;lastGood=millis();haveData=true;copyText(networkState,"Receiving aircraft");refreshUI(nullptr);lvgl_port_unlock();
-    pollDelay=viewMiles()*1.45>requestMiles+.01?100:POLL_MS;Serial.printf("RADAR: %d airborne aircraft within %g miles\n",count,requestMiles);return true;
+    pollDelay=POLL_MS;Serial.printf("RADAR: provider=adsb.fi %d airborne aircraft within %g miles\n",count,requestMiles);return true;
 }
 void lookupSelectedRoute() {
     char callsign[16]{};double latitude=0,longitude=0;
@@ -605,7 +628,7 @@ void serviceSerial() {
         char c=Serial.read();if(c=='\r')continue;
         if(c!='\n'){if(command.length()<768)command+=c;else overflow=true;continue;}
         if(overflow) Serial.println("CONFIG_ERROR Command too long.");
-        else if(command=="STATUS")Serial.printf("RADAR: mode=%s wifi=%s center=%.6f,%.6f aircraft=%d heap=%u psram=%u version=1.4 followNearest=%d selected=%s nearest=%s feed=%s\n",usbSetup?"usb-setup":"radar",WiFi.status()==WL_CONNECTED?"connected":"offline",centerLat,centerLon,planeCount,ESP.getFreeHeap(),ESP.getFreePsram(),followNearest,selectedHex,planeCount?planes[0].hex:"",networkState);
+        else if(command=="STATUS")Serial.printf("RADAR: mode=%s wifi=%s center=%.6f,%.6f aircraft=%d heap=%u psram=%u version=1.5 followNearest=%d selected=%s nearest=%s provider=adsb.fi retry_s=%lu feed=%s\n",usbSetup?"usb-setup":"radar",WiFi.status()==WL_CONNECTED?"connected":"offline",centerLat,centerLon,planeCount,ESP.getFreeHeap(),ESP.getFreePsram(),followNearest,selectedHex,planeCount?planes[0].hex:"",(unsigned long)feedRetryRemaining(),networkState);
         else if(command=="PAGE WEATHER"){lvgl_port_lock(-1);weather::show(true);lvgl_port_unlock();Serial.println("PAGE_OK WEATHER");}
         else if(command=="PAGE FLIGHTS"){lvgl_port_lock(-1);weather::show(false);lvgl_port_unlock();Serial.println("PAGE_OK FLIGHTS");}
         else if(command=="WEATHER")weather::diagnostics();
@@ -633,7 +656,7 @@ void serviceSerial() {
 }
 
 void setup() {
-    Serial.setRxBufferSize(1024);Serial.begin(921600);delay(200);Serial.println("RADAR: San Diego Flight Radar v1.4");
+    Serial.setRxBufferSize(1024);Serial.begin(921600);delay(200);Serial.println("RADAR: San Diego Flight Radar v1.5");
     // Independent boundary and bearing checks run on the actual target at boot.
     const auto east=radar::project(0,0,0,1), north=radar::project(0,0,1,0);
     const auto acrossDateLine=radar::project(0,179.99,0,-179.99);
@@ -646,12 +669,25 @@ void setup() {
         &&!radar::plausibleRoute(32.73,-117.20,33.6407,-84.4277,33.3699,-81.9645)
         &&radar::plausibleRoute(32.73,-117.20,37.6213,-122.3790,32.7336,-117.1897);
     Serial.printf("RADAR: route plausibility BNA-IAD / ATL-AGS reject, SFO-SAN accept %s\n",routeOK?"PASS":"FAIL");assert(routeOK);
+    const bool retryOK=feed_retry::delaySeconds("120","",1700000000)==120
+        &&feed_retry::delaySeconds("","35283",1700000000)==35283
+        &&feed_retry::delaySeconds("","1700000060",1700000000)==60
+        &&feed_retry::delaySeconds("Tue, 14 Nov 2023 22:14:20 GMT","",1700000000)==60
+        &&feed_retry::delaySeconds("Thu, 29 Feb 2024 00:00:00 GMT","",1709164740)==60
+        &&feed_retry::delaySeconds("Thu, 29 Feb 2023 00:00:00 GMT","",1700000000)==120
+        &&feed_retry::delaySeconds("0","900",1700000000)==0
+        &&feed_retry::delaySeconds("","1699999999",1700000000)==0
+        &&feed_retry::delaySeconds("garbage","-1",1700000000)==120
+        &&feed_retry::delaySeconds("4294967295","",1700000000)==UINT32_MAX;
+    Serial.printf("RADAR: feed retry seconds / epoch / UTC date self-test %s\n",retryOK?"PASS":"FAIL");assert(retryOK);
     board=new Board();assert(board->init());auto lcd=board->getLCD();
     lcd->configFrameBufferNumber(LVGL_PORT_DISP_BUFFER_NUM);
     auto bus=static_cast<BusRGB*>(lcd->getBus());bus->configRGB_FreqHz(13000000);bus->configRGB_BounceBufferSize(800*10);
     assert(board->begin());assert(lvgl_port_init(lcd,board->getTouch()));
     lvgl_port_lock(-1);buildUI();lvgl_port_unlock();
     loadConfig();
+    Preferences feedStorage;
+    if(feedStorage.begin("radar-feed-fi",true)){feedRetryUntil=feedStorage.getULong64("retry-until",0);feedStorage.end();}
     if(ssid.isEmpty()){beginUSBSetup();return;}
     WiFi.mode(WIFI_STA);WiFi.setSleep(false);WiFi.setAutoReconnect(true);WiFi.begin(ssid.c_str(),wifiPassword.c_str());
     configTzTime("PST8PDT,M3.2.0,M11.1.0","pool.ntp.org","time.cloudflare.com");
@@ -667,7 +703,7 @@ void loop() {
     if(usbSetup){delay(5);return;}
     if(WiFi.status()!=WL_CONNECTED){setState("Wi-Fi reconnecting / SETUP to change");delay(100);return;}
     if(time(nullptr)<1700000000){setState("Syncing clock for secure data");delay(100);return;}
-    if(due(millis(),nextPoll)){pollAircraft();nextPoll=millis()+pollDelay;}
+    if(!feedRetryRemaining()&&due(millis(),nextPoll)){pollAircraft();nextPoll=millis()+pollDelay;}
     if(due(millis(),nextRoute)){lookupSelectedRoute();if(due(millis(),nextRoute))nextRoute=millis()+2000;}
     weather::service();
     fetchSelectedLogo();

@@ -75,13 +75,13 @@ The updater verifies binary hashes and the existing partition table, backs up NV
 
 ## Data and limits
 
-Aircraft positions refresh about every ten seconds with retry backoff. Stale targets are removed; the nearest 256 aircraft are retained. Large temporary buffers and filtered aircraft JSON use PSRAM. Secure HTTP uses the ESP32 certificate bundle and requires a valid network time.
+Aircraft positions come from adsb.fi and refresh about every ten seconds with retry backoff. Its documented public limit is one request per second. Zoom redraws immediately and requests the new extent at the next permitted poll; it cannot bypass pacing or a rate-limit wait. HTTP 429 waits appear as a countdown, honor numeric or dated Retry-After / reset headers, and survive reboot and application updates in NVS. Stale targets are removed; the nearest 256 aircraft are retained. Large temporary buffers and filtered aircraft JSON use PSRAM. Secure HTTP uses the ESP32 certificate bundle and requires a valid network time.
 
 Origin/destination data comes from a callsign database, not aircraft ADS-B broadcasts, and may be missing or outdated. Implausible routes are rejected; remaining routes are labeled estimates. A geometric check cannot prove that a route is current. A commercial current-flight API is a planned optional improvement.
 
 The 40-mile maximum keeps response sizes manageable. A larger experimental regional request was truncated on the device even though the host computer could download it; that range is not enabled. Weather frames retry failed downloads and retain successful frames. Coastline and runway projections are cached in PSRAM and recomputed only when center or zoom changes, avoiding expensive geographic calculations during every redraw.
 
-- [ADSB.lol](https://www.adsb.lol/docs/open-data/api/): live positions; ODbL.
+- [adsb.fi](https://adsb.fi/): live aircraft positions, personal non-commercial use. [API documentation and terms](https://github.com/adsbfi/opendata).
 - [ADSBdb](https://www.adsbdb.com/): callsign routes and carrier metadata.
 - [Open-Meteo](https://open-meteo.com/en/docs): HRRR, ECMWF and GFS forecasts. Provider wind/gust conventions differ; values are preserved.
 - [NOAA nowCOAST](https://nowcoast.noaa.gov/): observed satellite and radar imagery, not forecast animation.
@@ -93,7 +93,7 @@ Use provider services within their current terms and rate limits. This is an inf
 
 ## Diagnostics
 
-Serial is 921600 baud with newline-terminated commands. `STATUS` reports connection, aircraft, and memory; `WEATHER` reports model/image state. Send `PERF` twice, at least one second apart, to measure the intervening idle-task runtime and estimate each core's busy percentage; it also reports memory low-water marks. These scheduler measurements are diagnostic estimates, not cycle-exact profiling. `RADAR ZOOM+` and `RADAR ZOOM-` exercise touch zoom. `NEAREST` restores automatic selection. `SETTINGS` returns SSID/coordinates without the password. `PAGE FLIGHTS`, `PAGE WEATHER`, `PAGE WIND`, and `PAGE WEEK` change pages. `SCREENSHOT` returns an 800 x 480 RGB565 framebuffer. Distance/bearing and route plausibility checks run at boot.
+Serial is 921600 baud with newline-terminated commands. `STATUS` reports connection, aircraft, and memory; `WEATHER` reports model/image state. Send `PERF` twice, at least one second apart, to measure the intervening idle-task runtime and estimate each core's busy percentage; it also reports memory low-water marks. These scheduler measurements are diagnostic estimates, not cycle-exact profiling. `RADAR ZOOM+` and `RADAR ZOOM-` exercise touch zoom. `NEAREST` restores automatic selection. `SETTINGS` returns SSID/coordinates without the password. `PAGE FLIGHTS`, `PAGE WEATHER`, `PAGE WIND`, and `PAGE WEEK` change pages. `SCREENSHOT` returns an 800 x 480 RGB565 framebuffer. Distance/bearing, route plausibility, and HTTP retry parsing checks run at boot. `STATUS` includes the feed provider and cooldown seconds.
 
 ## Measured performance
 
@@ -114,6 +114,8 @@ The 40-mile sample tracked 61 aircraft. Runtime free memory was about 140-143 KB
 - [ ] Extend performance sampling to sustained mixed flight/weather animation and longest UI/network delays.
 
 [FlightAware pricing](https://www.flightaware.com/commercial/aeroapi/). [TheFlightWall FAQ](https://theflightwall.com/pages/faq) says its product price includes core data access from several partners; it does not disclose the partners or their fees. No paid API key is included or enabled here.
+
+At the pricing checked on October 19, 2026, `GET /flights/{ident}` costs $0.005 per result page: the $5 allowance covers 1,000 single-page lookups per month (about 32 per day). A 24/7 display near a busy airport should not assume it fits that allowance. For a 30-day month, 100 lookups/day means $15 in query usage before the allowance. Proposed integration: retain free radar positions, cache selected-flight details, restrict each request to one page, and stop paid requests at a persistent $4 device budget. This spending guard is planned, not implemented. Account-wide usage must also be checked because other clients share the allowance. [FlightAware usage tracking](https://support.flightaware.com/hc/en-us/articles/32551385660055-How-Do-I-Check-My-API-Usage) updates about every ten minutes.
 
 ## License and attribution
 
